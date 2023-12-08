@@ -22,7 +22,7 @@ serde = { version = "1" }
 thiserror = { version = "1" }
 anyhow = "1"
 macaroon = { version = "0.3" }
-bfsp = { path = "../bfsp", default-features = false, features = [
+bfsp = { git = "https://github.com/Billy-s-E2EE-File-Server/bfsp", default-features = false, features = [
     "config",
     "auth",
     "cli",
