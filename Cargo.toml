@@ -1,0 +1,31 @@
+[package]
+name = "befsd"
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+debug = true
+
+[dependencies]
+fern = "0.6"
+humantime = "2"
+interprocess = { version = "1", features = ["tokio_support"] }
+log = "0.4"
+notify = "6"
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio"] }
+tokio = { version = "1", features = ["net", "fs", "rt-multi-thread", "macros"] }
+futures = { version = "0.3", default-features = false, features = [
+    "std",
+    "executor",
+] }
+serde = { version = "1" }
+thiserror = { version = "1" }
+anyhow = "1"
+macaroon = { version = "0.3" }
+bfsp = { path = "../bfsp", default-features = false, features = [
+    "config",
+    "auth",
+    "cli",
+] }
+hex = "0.4"
+dashmap = { version = "5" }
