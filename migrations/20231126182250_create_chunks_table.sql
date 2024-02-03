@@ -4,6 +4,7 @@ create table chunks (
     indice int not null,
     chunk_size int not null,
     file_hash text not null,
-    nonce blob not null
+    nonce blob not null,
+    uploaded bool not null default false
 )
 

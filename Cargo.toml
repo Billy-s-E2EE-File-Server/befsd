@@ -29,3 +29,5 @@ bfsp = { git = "https://github.com/Billy-s-E2EE-File-Server/bfsp", default-featu
 ] }
 hex = "0.4"
 dashmap = { version = "5" }
+prost = { version = "0.12" }
+path-absolutize = "3.1.1"

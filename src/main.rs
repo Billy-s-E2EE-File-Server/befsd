@@ -3,11 +3,15 @@ mod ipc;
 mod watcher;
 
 use anyhow::Context;
+use bfsp::ipc::{directory_listing, DirectoryListing};
 use bfsp::{cli::FileHeader, hash_file, ChunkHash, EncryptionKey, FileHash};
 use bfsp::{config::*, ChunkID, ChunkMetadata};
 use dashmap::DashMap;
 use file_server::*;
+use futures::StreamExt;
 use log::trace;
+use tokio::fs::remove_dir;
+use tokio::io;
 use watcher::*;
 
 use notify::{event::CreateKind, INotifyWatcher, Watcher};
@@ -107,6 +111,33 @@ async fn main() -> Result<()> {
     let (watcher, mut file_event_receiver) = async_watcher().unwrap();
     let watcher = Arc::new(RwLock::new(watcher));
 
+    log::info!("Initializing watcher");
+    for path in sqlx::query!("select path from directories_to_watch")
+        .fetch_all(&pool)
+        .await?
+        .into_iter()
+        .map(|row| row.path)
+    {
+        let path = PathBuf::from(path);
+
+        log::debug!("Adding directory to watch: {}", path.display());
+
+        let watcher = &mut watcher.write().await;
+
+        if let Err(err) = watcher.watch(&path, notify::RecursiveMode::Recursive) {
+            match err.kind {
+                notify::ErrorKind::Io(err) => match err.kind() {
+                    io::ErrorKind::NotFound => {
+                        remove_directory(&path, &pool, watcher).await.unwrap()
+                    }
+                    _ => panic!("{err}"),
+                },
+                _ => panic!("{err}"),
+            };
+        }
+    }
+    log::info!("Intialized watcher");
+
     let file_locks: Arc<DashMap<PathBuf, Mutex<()>>> = Arc::new(DashMap::new());
 
     tokio::task::spawn(ipc::server_loop(watcher.clone(), pool.clone()));
@@ -139,7 +170,7 @@ async fn main() -> Result<()> {
 
                     trace!("Locking file {}", path.display());
 
-                    // The file lock prevents us from modifying the same file at the same time on the server
+                    // The file lock prevents us from modifying the same file at the same time on the daemon
                     let lock = file_locks.get(&path).unwrap_or_else(|| {
                         file_locks.insert(path.clone(), Mutex::new(()));
                         file_locks.get(&path).unwrap()
@@ -234,8 +265,8 @@ async fn add_file(
     key: &EncryptionKey,
     macaroon: &str,
 ) -> Result<(), AddFileErr> {
-    let file_path = fs::canonicalize(file_path).await?;
     trace!("Adding file {}", file_path.display());
+    let file_path = fs::canonicalize(file_path).await?;
     let file_path = file_path.to_str().unwrap();
 
     let mut file = fs::File::open(file_path).await?;
@@ -247,17 +278,14 @@ async fn add_file(
     let file_hash = hash_file(&mut file).await.unwrap();
     file.rewind().await?;
 
-    let num_chunks: i64 = file_header.chunks.len().try_into().unwrap();
-
     sqlx::query!(
         r#"insert into files
-            (file_path, hash, chunk_size, num_chunks)
-            values ( ?, ?, ?, ? )
+            (file_path, hash, chunk_size)
+            values ( ?, ?, ? )
         "#,
         file_path,
         file_hash,
         file_header.chunk_size,
-        num_chunks
     )
     .execute(&pool)
     .await
@@ -317,6 +345,8 @@ async fn add_file(
 pub enum UpdateFileErr {
     #[error("IO error: {0}")]
     IOErr(#[from] std::io::Error),
+    #[error("Unknown database error: {0}")]
+    UnknownDBError(#[from] sqlx::Error),
 }
 
 async fn update_file(
@@ -326,19 +356,19 @@ async fn update_file(
     key: &EncryptionKey,
     macaroon: &str,
 ) -> Result<(), UpdateFileErr> {
-    let file_path = fs::canonicalize(file_path).await?;
     trace!("Updating file {}", file_path.display());
+    let file_path = fs::canonicalize(file_path).await?;
 
     let file_path_str = file_path.to_str().unwrap();
 
     let original_file_hash: FileHash =
-        sqlx::query!("select hash from files where file_path = ?", file_path_str)
+        match sqlx::query!("select hash from files where file_path = ?", file_path_str)
             .fetch_one(&pool)
             .await
-            .unwrap()
-            .hash
-            .try_into()
-            .unwrap();
+        {
+            Ok(res) => res.hash.try_into().unwrap(),
+            Err(err) => return Err(UpdateFileErr::UnknownDBError(err)),
+        };
 
     let (file_header, file_hash) = {
         let mut file = File::open(file_path_str).await?;
@@ -353,10 +383,9 @@ async fn update_file(
     let num_chunks: i64 = file_header.chunks.len().try_into().unwrap();
 
     sqlx::query!(
-        "update files set hash = ?, chunk_size = ?, num_chunks = ? where file_path = ?",
+        "update files set hash = ?, chunk_size = ? where file_path = ?",
         file_hash,
         file_header.chunk_size,
-        num_chunks,
         file_path_str
     )
     .execute(&pool)
@@ -539,4 +568,78 @@ async fn file_header_from_db(
         chunks,
         chunk_indices,
     })
+}
+
+#[derive(Error, Debug)]
+enum ListDirectoryError {
+    #[error("Unknown database error: {0}")]
+    UnknownDBError(#[from] sqlx::Error),
+}
+
+async fn list_directory(
+    dir: &Path,
+    pool: &SqlitePool,
+) -> Result<DirectoryListing, ListDirectoryError> {
+    let path_query = dir.to_str().unwrap().to_owned() + "%";
+
+    let listings = sqlx::query!(
+        "select hash, file_path from files where file_path like ?",
+        path_query,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|file_info| async move {
+        let file_path = PathBuf::try_from(file_info.file_path).unwrap();
+
+        let total_chunks = sqlx::query!(
+            "select count(*) as count from chunks where file_hash = ?",
+            file_info.hash
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .count;
+
+        let chunks_uploaded = sqlx::query!(
+            "select count(*) as count from chunks where file_hash = ? and uploaded = true",
+            file_info.hash
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .count;
+
+        let path_in_dir_somewhere: bool = {
+            let mut path_in_dir_somewhere = false;
+            let mut file_path = file_path.as_path();
+
+            while let Some(parent) = file_path.parent() {
+                if parent == dir {
+                    path_in_dir_somewhere = true;
+                }
+
+                file_path = parent;
+            }
+
+            path_in_dir_somewhere
+        };
+
+        match path_in_dir_somewhere {
+            true => Some(directory_listing::File {
+                path: file_path.to_str().unwrap().to_string(),
+                chunks_uploaded,
+                total_chunks,
+            }),
+            false => None,
+        }
+    });
+
+    let files = futures::future::join_all(listings)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(DirectoryListing { file: files })
 }

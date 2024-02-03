@@ -1,24 +1,25 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
-use futures::AsyncReadExt;
+use futures::{AsyncReadExt, AsyncWriteExt};
 use interprocess::local_socket::{
     tokio::{LocalSocketListener, LocalSocketStream},
     NameTypeSupport,
 };
 use notify::INotifyWatcher;
+use path_absolutize::Absolutize;
 use sqlx::SqlitePool;
 use thiserror::Error;
 
 use bfsp::{
     ipc::{self},
-    Message,
+    Message, PrependLen,
 };
 use tokio::{
     fs,
     sync::{Mutex, RwLock},
 };
 
-use crate::{add_directory, remove_directory, AddDirectoryErr};
+use crate::{add_directory, list_directory, remove_directory, AddDirectoryErr, ListDirectoryError};
 
 #[derive(Error, Debug)]
 pub enum IPCServerError {
@@ -72,6 +73,8 @@ enum HandleIPCConnErr {
     NoIPCMessage,
     #[error(transparent)]
     AddDirectoryError(#[from] AddDirectoryErr),
+    #[error(transparent)]
+    ListDirectoryError(#[from] ListDirectoryError),
 }
 
 async fn handle_conn(
@@ -79,21 +82,38 @@ async fn handle_conn(
     watcher: Arc<RwLock<INotifyWatcher>>,
     pool: SqlitePool,
 ) -> Result<(), HandleIPCConnErr> {
-    let (mut reader, _writer) = sock.into_split();
+    let (mut reader, mut writer) = sock.into_split();
 
-    let mut msg = Vec::new();
-    reader.read_to_end(&mut msg).await?;
+    let mut len = [0u8; 4];
+    println!("Reading len");
+    reader.read_exact(&mut len).await?;
+    let len: u32 = u32::from_le_bytes(len[..].try_into().unwrap());
+
+    println!("Reading msg of len {len}");
+    let mut msg = vec![0; len as usize];
+    reader.read_exact(&mut msg).await?;
 
     let msg = ipc::IpcMessage::decode(msg.as_slice()).map_err(|_| HandleIPCConnErr::DecodeError)?;
 
     match msg.message.ok_or(HandleIPCConnErr::NoIPCMessage)? {
         ipc::ipc_message::Message::AddDirectory(info) => {
-            let path = fs::canonicalize(&PathBuf::from_str(&info.directory).unwrap()).await?;
+            let path = PathBuf::from_str(&info.directory).unwrap();
+            let path = path.absolutize().unwrap();
             add_directory(&path, &pool, &mut *watcher.write().await).await?;
         }
         ipc::ipc_message::Message::RemoveDirectory(info) => {
-            let path = fs::canonicalize(&PathBuf::from_str(&info.directory).unwrap()).await?;
+            let path = PathBuf::from_str(&info.directory).unwrap();
+            let path = path.absolutize().unwrap();
             remove_directory(&path, &pool, &mut *watcher.write().await).await?;
+        }
+        ipc::ipc_message::Message::ListDirectory(info) => {
+            let path = PathBuf::from_str(&info.directory).unwrap();
+            let path = path.absolutize().unwrap();
+            let dir_listing = list_directory(&path, &pool).await?;
+
+            writer
+                .write_all(dir_listing.encode_to_vec().prepend_len().as_slice())
+                .await?;
         }
     }
 
