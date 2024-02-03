@@ -1,12 +1,17 @@
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Context, Result};
-use bfsp::Message as FileMessage;
+use bfsp::file_server_message::DeleteChunksQuery;
 use bfsp::{
     cli::{compressed_encrypted_chunk_from_file, FileHeader},
     file_server_message::{Authentication, Message, UploadChunkQuery},
     ChunkID, EncryptionKey, FileServerMessage, UploadChunkResp,
 };
+use bfsp::{DeleteChunksResp, FileHash, Message as FileMessage, PrependLen};
 use log::trace;
 use macaroon::Macaroon;
+use sqlx::{pool, QueryBuilder, SqlitePool};
+use thiserror::Error;
 use tokio::{
     fs::OpenOptions,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -21,18 +26,6 @@ pub async fn upload_file(
     key: &EncryptionKey,
     macaroon: &str,
 ) -> Result<()> {
-    {
-        let macaroon = Macaroon::deserialize(macaroon).unwrap();
-        macaroon.caveats().into_iter().for_each(|caveat| {
-            let bstring = match caveat {
-                macaroon::Caveat::FirstParty(b) => b.predicate(),
-                macaroon::Caveat::ThirdParty(b) => todo!(),
-            };
-
-            println!("Caveat: {:?}", bstring.to_string());
-        });
-    }
-
     trace!("Uploading file");
     let chunks_to_upload = file_header.chunks.values();
 
@@ -79,6 +72,55 @@ pub async fn upload_file(
     }
 
     trace!("Uploaded file");
+
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum DeleteChunksErr {}
+
+/// Delete the chunks locally and on the server, but don't delete the file_header
+pub async fn delete_chunks(
+    file_hash: &FileHash,
+    sock: &mut TcpStream,
+    macaroon: &str,
+    pool: &SqlitePool,
+) -> Result<()> {
+    trace!("Deleting chunks");
+    trace!("Deleting chunks locally");
+
+    let chunks_to_delete = sqlx::query!(
+        "delete from chunks where file_hash = ? returning id",
+        file_hash
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| ChunkID::try_from(row.id).unwrap().to_bytes().to_vec())
+    .collect::<Vec<_>>();
+
+    trace!("Deleting chunks on server");
+    let msg = FileServerMessage {
+        auth: Some(Authentication {
+            macaroon: macaroon.to_string(),
+        }),
+        message: Some(Message::DeleteChunksQuery(DeleteChunksQuery {
+            chunk_ids: chunks_to_delete,
+        })),
+    }
+    .encode_to_vec()
+    .prepend_len();
+
+    sock.write_all(&msg).await?;
+
+    let resp_len = sock.read_u32_le().await?;
+    let mut msg = vec![0; resp_len as usize];
+    sock.read_exact(&mut msg).await?;
+
+    let resp = DeleteChunksResp::decode(msg.as_slice())
+        .map_err(|_| anyhow!("Error deserializing DeleteChunksResp"))?;
+
+    trace!("Deleted chunks");
 
     Ok(())
 }

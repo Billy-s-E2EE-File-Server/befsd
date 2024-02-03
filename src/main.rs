@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use file_server::*;
 use futures::StreamExt;
 use log::trace;
+use path_absolutize::Absolutize;
 use tokio::fs::remove_dir;
 use tokio::io;
 use watcher::*;
@@ -357,8 +358,7 @@ async fn update_file(
     macaroon: &str,
 ) -> Result<(), UpdateFileErr> {
     trace!("Updating file {}", file_path.display());
-    let file_path = fs::canonicalize(file_path).await?;
-
+    let file_path = file_path.absolutize().unwrap();
     let file_path_str = file_path.to_str().unwrap();
 
     let original_file_hash: FileHash =
@@ -380,8 +380,6 @@ async fn update_file(
         (file_header, file_hash)
     };
 
-    let num_chunks: i64 = file_header.chunks.len().try_into().unwrap();
-
     sqlx::query!(
         "update files set hash = ?, chunk_size = ? where file_path = ?",
         file_hash,
@@ -401,12 +399,12 @@ async fn update_file(
     })
     .unwrap();
 
-    trace!("Deleting chunks for file {file_path_str}");
-
-    sqlx::query!("delete from chunks where file_hash = ?", original_file_hash)
-        .execute(&pool)
-        .await
-        .unwrap();
+    {
+        let sock = &mut sock.lock().await;
+        delete_chunks(&original_file_hash, sock, macaroon, &pool)
+            .await
+            .unwrap();
+    }
 
     trace!("Inserting chunks for file {file_path_str}");
 
@@ -414,14 +412,15 @@ async fn update_file(
         let indice: i64 = indice.try_into().unwrap();
         sqlx::query!(
             r#"insert into chunks
-                (hash, id, file_hash, chunk_size, indice)
-                values ( ?, ?, ?, ?, ? )
+                (hash, id, file_hash, chunk_size, indice, nonce)
+                values ( ?, ?, ?, ?, ?, ? )
             "#,
             chunk.hash,
             chunk_id,
             file_header.hash,
             chunk.size,
             indice,
+            chunk.nonce,
         )
         .execute(&pool)
         .await
@@ -479,19 +478,30 @@ async fn remove_directory(
     watcher: &mut INotifyWatcher,
 ) -> Result<(), AddDirectoryErr> {
     trace!("Removing directory {}", dir.display());
-    if !dir.is_dir() {
-        return Err(AddDirectoryErr::NotADirectory);
+    if let Ok(meta) = fs::metadata(dir).await {
+        if !meta.is_dir() {
+            return Err(AddDirectoryErr::NotADirectory);
+        }
     }
 
     let dir_str = dir.to_str().unwrap();
+    sqlx::query!("delete from directories_to_watch where path = ?", dir_str)
+        .execute(pool)
+        .await?;
+
     sqlx::query!(
-        "insert into directories_to_watch (path) values (?)",
+        "delete from chunks where file_hash in (select hash from files where file_path = ?)",
         dir_str
     )
     .execute(pool)
     .await?;
 
-    watcher.unwatch(dir).unwrap();
+    if let Err(err) = watcher.unwatch(dir) {
+        match err.kind {
+            notify::ErrorKind::PathNotFound => (),
+            _ => panic!("{err}"),
+        }
+    }
 
     Ok(())
 }
