@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use bfsp::file_server_message::DeleteChunksQuery;
@@ -8,7 +9,7 @@ use bfsp::{
     ChunkID, EncryptionKey, FileServerMessage, UploadChunkResp,
 };
 use bfsp::{DeleteChunksResp, FileHash, Message as FileMessage, PrependLen};
-use log::trace;
+use log::{debug, trace};
 use macaroon::Macaroon;
 use sqlx::{pool, QueryBuilder, SqlitePool};
 use thiserror::Error;
@@ -79,6 +80,26 @@ pub async fn upload_file(
 #[derive(Debug, Error)]
 pub enum DeleteChunksErr {}
 
+pub async fn delete_chunks_from_file_path(
+    file_path: &str,
+    sock: &mut TcpStream,
+    macaroon: &str,
+    pool: &SqlitePool,
+) -> Result<()> {
+    debug!("Deleting chunks from file_path {file_path}");
+    let path_query = file_path.to_owned() + "%";
+
+    let file_hash: FileHash =
+        sqlx::query!("select hash from files where file_path like ?", path_query,)
+            .fetch_one(pool)
+            .await?
+            .hash
+            .try_into()
+            .with_context(|| anyhow!("Error getting has from file_path: {file_path}"))?;
+
+    delete_chunks(&file_hash, sock, macaroon, pool).await
+}
+
 /// Delete the chunks locally and on the server, but don't delete the file_header
 pub async fn delete_chunks(
     file_hash: &FileHash,
@@ -94,7 +115,8 @@ pub async fn delete_chunks(
         file_hash
     )
     .fetch_all(pool)
-    .await?
+    .await
+    .with_context(|| anyhow!("Failed deleting chunks with file_hash {file_hash}"))?
     .into_iter()
     .map(|row| ChunkID::try_from(row.id).unwrap().to_bytes().to_vec())
     .collect::<Vec<_>>();

@@ -15,7 +15,7 @@ use bfsp::{
     Message, PrependLen,
 };
 use tokio::{
-    fs,
+    net::TcpStream,
     sync::{Mutex, RwLock},
 };
 
@@ -31,6 +31,8 @@ pub enum IPCServerError {
 
 pub async fn server_loop(
     watcher: Arc<RwLock<INotifyWatcher>>,
+    sock: Arc<Mutex<TcpStream>>,
+    macaroon: String,
     pool: SqlitePool,
 ) -> Result<(), IPCServerError> {
     let name = {
@@ -55,8 +57,10 @@ pub async fn server_loop(
         let watcher = watcher.clone();
         let pool = pool.clone();
 
+        let sock = sock.clone();
+        let macaroon = macaroon.clone();
         tokio::task::spawn(async move {
-            if let Err(e) = handle_conn(conn, watcher, pool).await {
+            if let Err(e) = handle_conn(conn, sock, macaroon, watcher, pool).await {
                 eprintln!("Error while handling connection: {}", e);
             }
         });
@@ -79,6 +83,8 @@ enum HandleIPCConnErr {
 
 async fn handle_conn(
     sock: LocalSocketStream,
+    server_sock: Arc<Mutex<TcpStream>>,
+    macaroon: String,
     watcher: Arc<RwLock<INotifyWatcher>>,
     pool: SqlitePool,
 ) -> Result<(), HandleIPCConnErr> {
@@ -104,7 +110,17 @@ async fn handle_conn(
         ipc::ipc_message::Message::RemoveDirectory(info) => {
             let path = PathBuf::from_str(&info.directory).unwrap();
             let path = path.absolutize().unwrap();
-            remove_directory(&path, &pool, &mut *watcher.write().await).await?;
+
+            let server_sock = &mut server_sock.lock().await;
+
+            remove_directory(
+                &path,
+                &pool,
+                server_sock,
+                &macaroon,
+                &mut *watcher.write().await,
+            )
+            .await?;
         }
         ipc::ipc_message::Message::ListDirectory(info) => {
             let path = PathBuf::from_str(&info.directory).unwrap();

@@ -8,10 +8,8 @@ use bfsp::{cli::FileHeader, hash_file, ChunkHash, EncryptionKey, FileHash};
 use bfsp::{config::*, ChunkID, ChunkMetadata};
 use dashmap::DashMap;
 use file_server::*;
-use futures::StreamExt;
 use log::trace;
 use path_absolutize::Absolutize;
-use tokio::fs::remove_dir;
 use tokio::io;
 use watcher::*;
 
@@ -49,7 +47,7 @@ async fn main() -> Result<()> {
             ))
         }) // Add blanket level filter -
         .level(log::LevelFilter::Trace)
-        .level_for("sqlx", log::LevelFilter::Warn)
+        .level_for("sqlx", log::LevelFilter::Debug)
         .level_for("hyper", log::LevelFilter::Warn)
         // - and per-module overrides
         // Output to stdout, files, and other Dispatch configurations
@@ -112,6 +110,12 @@ async fn main() -> Result<()> {
     let (watcher, mut file_event_receiver) = async_watcher().unwrap();
     let watcher = Arc::new(RwLock::new(watcher));
 
+    let sock = Arc::new(Mutex::new(
+        TcpStream::connect("::1:9999")
+            .await
+            .with_context(|| "error connecting to file server")?,
+    ));
+
     log::info!("Initializing watcher");
     for path in sqlx::query!("select path from directories_to_watch")
         .fetch_all(&pool)
@@ -129,7 +133,11 @@ async fn main() -> Result<()> {
             match err.kind {
                 notify::ErrorKind::Io(err) => match err.kind() {
                     io::ErrorKind::NotFound => {
-                        remove_directory(&path, &pool, watcher).await.unwrap()
+                        let sock = &mut sock.lock().await;
+                        let macaroon = macaroon.serialize(macaroon::Format::V2).unwrap();
+                        remove_directory(&path, &pool, sock, &macaroon, watcher)
+                            .await
+                            .unwrap()
                     }
                     _ => panic!("{err}"),
                 },
@@ -141,12 +149,11 @@ async fn main() -> Result<()> {
 
     let file_locks: Arc<DashMap<PathBuf, Mutex<()>>> = Arc::new(DashMap::new());
 
-    tokio::task::spawn(ipc::server_loop(watcher.clone(), pool.clone()));
-
-    let sock = Arc::new(Mutex::new(
-        TcpStream::connect("::1:9999")
-            .await
-            .with_context(|| "error connecting to file server")?,
+    tokio::task::spawn(ipc::server_loop(
+        watcher.clone(),
+        sock.clone(),
+        macaroon.serialize(macaroon::Format::V2).unwrap(),
+        pool.clone(),
     ));
 
     while let Some(event_result) = file_event_receiver.recv().await {
@@ -475,6 +482,8 @@ async fn add_directory(
 async fn remove_directory(
     dir: &Path,
     pool: &SqlitePool,
+    sock: &mut TcpStream,
+    macaroon: &str,
     watcher: &mut INotifyWatcher,
 ) -> Result<(), AddDirectoryErr> {
     trace!("Removing directory {}", dir.display());
@@ -489,16 +498,13 @@ async fn remove_directory(
         .execute(pool)
         .await?;
 
-    sqlx::query!(
-        "delete from chunks where file_hash in (select hash from files where file_path = ?)",
-        dir_str
-    )
-    .execute(pool)
-    .await?;
+    delete_chunks_from_file_path(dir.to_str().unwrap(), sock, macaroon, pool)
+        .await
+        .unwrap();
 
     if let Err(err) = watcher.unwatch(dir) {
         match err.kind {
-            notify::ErrorKind::PathNotFound => (),
+            notify::ErrorKind::PathNotFound | notify::ErrorKind::WatchNotFound => (),
             _ => panic!("{err}"),
         }
     }
