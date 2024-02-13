@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update files set hash = ?, chunk_size = ? where file_path = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "78bb261e7c283b52ed97569f63d6f941ca3253346f6a9ddd4fc0b50c358450bd"
+}

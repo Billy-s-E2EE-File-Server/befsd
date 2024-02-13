@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select path from directories_to_watch",
+  "describe": {
+    "columns": [
+      {
+        "name": "path",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f0e77de0769ecaeb176972003cf4b90e9ac8fb7ad46411d30feb49117cd4f0c1"
+}

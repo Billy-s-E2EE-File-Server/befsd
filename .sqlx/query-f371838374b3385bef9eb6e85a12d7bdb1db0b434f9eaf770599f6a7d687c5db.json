@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into directories_to_watch (path) values (?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "f371838374b3385bef9eb6e85a12d7bdb1db0b434f9eaf770599f6a7d687c5db"
+}
